@@ -73,20 +73,54 @@ def build_fleet_query():
     }
 
 # --- Fetch Function ---
-def fetch_data(index, query):
-    url = f"{ELASTIC_URL}/{index}/_search"
-    log(f"Querying index: {index}")
-    start = time.time()
+def fetch_data(index, query, scroll_time="2m", batch_size=1000):
+    url = f"{ELASTIC_URL}/{index}/_search?scroll={scroll_time}"
+    query["size"] = batch_size
+    log(f"Starting scroll query on index: {index}")
+    
+    start_time = time.time()
+    all_hits = []
+
     try:
+        # Initial request
         resp = requests.post(url, headers=HEADERS, data=json.dumps(query), verify=False)
         resp.raise_for_status()
-        hits = resp.json()["hits"]["hits"]
-        end = time.time()
-        log(f"✓ Retrieved {len(hits)} records from '{index}' in {end - start:.2f} seconds")
-        return hits
+        response_json = resp.json()
+
+        scroll_id = response_json.get("_scroll_id")
+        hits = response_json["hits"]["hits"]
+        all_hits.extend(hits)
+
+        log(f"✓ Retrieved initial {len(hits)} hits...")
+
+        # Continue scrolling
+        while True:
+            if not hits:
+                break
+            scroll_url = f"{ELASTIC_URL}/_search/scroll"
+            scroll_query = {
+                "scroll": scroll_time,
+                "scroll_id": scroll_id
+            }
+            scroll_resp = requests.post(scroll_url, headers=HEADERS, data=json.dumps(scroll_query), verify=False)
+            scroll_resp.raise_for_status()
+            response_json = scroll_resp.json()
+            hits = response_json["hits"]["hits"]
+            scroll_id = response_json.get("_scroll_id")
+            if hits:
+                log(f"→ Retrieved {len(hits)} more hits...")
+                all_hits.extend(hits)
+            else:
+                break
+
+        end_time = time.time()
+        log(f"✓ Scroll complete: {len(all_hits)} total hits from '{index}' in {end_time - start_time:.2f} seconds")
+        return all_hits
+
     except requests.exceptions.RequestException as e:
-        log(f"✗ Error querying index '{index}': {e}")
+        log(f"✗ Scroll error on index '{index}': {e}")
         return []
+
 
 # --- Time Range (90 Days) ---
 now = datetime.utcnow()
