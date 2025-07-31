@@ -1,78 +1,137 @@
 import requests
 import json
 from datetime import datetime, timedelta
+import time
 
 # --- Config ---
 ELASTIC_URL = "https://your-elasticsearch-url:9200"
-API_KEY = "YOUR_BASE64_API_KEY"  # Base64 encoded "id:key"
+API_KEY = "YOUR_BASE64_API_KEY"
 
 HEADERS = {
     "Authorization": f"ApiKey {API_KEY}",
     "Content-Type": "application/json"
 }
 
-# --- Time range for 90 days ---
-now = datetime.utcnow()
-ninety_days_ago = now - timedelta(days=90)
-time_filter = {
-    "range": {
-        "@timestamp": {
-            "gte": ninety_days_ago.isoformat(),
-            "lte": now.isoformat()
+# --- Logging ---
+def log(message):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+
+# --- Build Queries ---
+def build_winsec_query():
+    return {
+        "_source": ["host.name", "source.domain"],
+        "size": 10000,
+        "query": {
+            "bool": {
+                "must": [
+                    {
+                        "range": {
+                            "@timestamp": {
+                                "gte": ninety_days_ago.isoformat(),
+                                "lte": now.isoformat()
+                            }
+                        }
+                    },
+                    {"match": {"event.code": "4624"}}
+                ],
+                "must_not": [
+                    {"terms": {"source.domain": ["", "-", None]}}
+                ]
+            }
         }
     }
-}
 
-# --- Query builder ---
-def build_query(source_fields, time_filter=None):
-    query = {
-        "_source": source_fields,
+def build_nac_query():
+    return {
+        "_source": ["host.name", "host.mac", "host.os.family", "source.domain"],
         "size": 10000,
-        "query": {"match_all": {}}
+        "query": {
+            "bool": {
+                "must": [],
+                "must_not": [
+                    {"terms": {"source.domain": ["", "-", None]}}
+                ]
+            }
+        }
     }
-    if time_filter:
-        query["query"] = time_filter
-    return query
 
-# --- Fetch function ---
+def build_fleet_query():
+    return {
+        "_source": [
+            "host.name", "host.ip", "last_checkin_status",
+            "local_metadata.os.family", "local_metadata.os.full", "tags",
+            "local_metadata.host.name"
+        ],
+        "size": 10000,
+        "query": {
+            "bool": {
+                "must_not": [
+                    {"terms": {"local_metadata.host.name": ["", "-", None]}}
+                ]
+            }
+        }
+    }
+
+# --- Fetch Function ---
 def fetch_data(index, query):
     url = f"{ELASTIC_URL}/{index}/_search"
-    resp = requests.post(url, headers=HEADERS, data=json.dumps(query), verify=False)
-    resp.raise_for_status()
-    return resp.json()["hits"]["hits"]
+    log(f"Querying index: {index}")
+    start = time.time()
+    try:
+        resp = requests.post(url, headers=HEADERS, data=json.dumps(query), verify=False)
+        resp.raise_for_status()
+        hits = resp.json()["hits"]["hits"]
+        end = time.time()
+        log(f"✓ Retrieved {len(hits)} records from '{index}' in {end - start:.2f} seconds")
+        return hits
+    except requests.exceptions.RequestException as e:
+        log(f"✗ Error querying index '{index}': {e}")
+        return []
 
-# --- Fetch from all indices ---
-winsec_query = build_query(["host.name", "source.domain"], time_filter)
-nac_query = build_query(["host.name", "host.mac", "host.os.family", "source.domain"])
-fleet_query = build_query([
-    "host.name", "host.ip", "last_checkin_status",
-    "local_metadata.os.family", "local_metadata.os.full", "tags",
-    "local_metadata.host.name"
-])
+# --- Time Range (90 Days) ---
+now = datetime.utcnow()
+ninety_days_ago = now - timedelta(days=90)
 
+# --- Build and Fetch ---
+log("Building queries...")
+winsec_query = build_winsec_query()
+nac_query = build_nac_query()
+fleet_query = build_fleet_query()
+log("✓ Queries built.\n")
+
+log("Fetching data from indices...\n")
 winsec_data = fetch_data("windows_security", winsec_query)
 nac_data = fetch_data("NAC_inventory", nac_query)
 fleet_data = fetch_data("fleet_inventory", fleet_query)
+log("✓ Data fetching complete.\n")
 
-# --- Collect and deduplicate names ---
+# --- Deduplication ---
+log("Extracting and deduplicating names...")
+start = time.time()
 all_names = set()
 
 for doc in winsec_data:
-    source_domain = doc["_source"].get("source", {}).get("domain")
-    if source_domain:
-        all_names.add(source_domain)
+    src_domain = doc["_source"].get("source", {}).get("domain")
+    if src_domain and src_domain.strip() and src_domain != "-":
+        all_names.add(src_domain)
 
 for doc in nac_data:
-    source_domain = doc["_source"].get("source", {}).get("domain")
-    if source_domain:
-        all_names.add(source_domain)
+    src_domain = doc["_source"].get("source", {}).get("domain")
+    if src_domain and src_domain.strip() and src_domain != "-":
+        all_names.add(src_domain)
 
 for doc in fleet_data:
-    host_name = doc["_source"].get("local_metadata", {}).get("host", {}).get("name")
-    if host_name:
-        all_names.add(host_name)
+    local_name = doc["_source"].get("local_metadata", {}).get("host", {}).get("name")
+    if local_name and local_name.strip() and local_name != "-":
+        all_names.add(local_name)
 
-# --- Result ---
+end = time.time()
 unique_names = sorted(all_names)
-print(f"Total unique names: {len(unique_names)}")
-print(unique_names)
+log(f"✓ Found {len(unique_names)} unique names in {end - start:.2f} seconds\n")
+
+# --- Output ---
+log("Final unique names:")
+for name in unique_names:
+    print(" -", name)
+
+log("Script completed successfully.")
