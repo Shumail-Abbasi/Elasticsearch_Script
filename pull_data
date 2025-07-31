@@ -1,0 +1,106 @@
+from elasticsearch import Elasticsearch
+from datetime import datetime, timedelta
+import json
+
+# --- Connect to Elasticsearch ---
+es = Elasticsearch(
+    ["http://localhost:9200"],  # Replace with your host
+    basic_auth=("elastic", "your_password")  # Replace with your credentials
+)
+
+# --- Helper to build the queries ---
+def build_query(index, fields, time_filter=None):
+    query = {
+        "_source": fields,
+        "size": 10000,
+        "query": {
+            "bool": {
+                "must": []
+            }
+        }
+    }
+    if time_filter:
+        query["query"]["bool"]["must"].append({
+            "range": {
+                "@timestamp": {
+                    "gte": time_filter["gte"],
+                    "lte": time_filter["lte"]
+                }
+            }
+        })
+    return query
+
+# --- Time range: Last 90 days ---
+now = datetime.utcnow()
+ninety_days_ago = now - timedelta(days=90)
+time_range = {
+    "gte": ninety_days_ago.isoformat(),
+    "lte": now.isoformat()
+}
+
+# --- Queries for each index ---
+winsec_query = build_query(
+    "windows_security",
+    ["host.name", "source.domain"],
+    time_range
+)
+
+nac_query = build_query(
+    "NAC_inventory",
+    ["host.name", "host.mac", "host.os.family", "source.domain"]
+)
+
+fleet_query = build_query(
+    "fleet_inventory",
+    ["host.name", "host.ip", "last_checkin_status", "local_metadata.os.family", "local_metadata.os.full", "tags", "local_metadata.host.name"]
+)
+
+# --- Fetch data from all indices ---
+def fetch_hits(index, query):
+    resp = es.search(index=index, body=query, scroll="2m")
+    hits = resp['hits']['hits']
+    scroll_id = resp['_scroll_id']
+
+    while len(resp['hits']['hits']):
+        resp = es.scroll(scroll_id=scroll_id, scroll="2m")
+        hits.extend(resp['hits']['hits'])
+        if not resp['hits']['hits']:
+            break
+    return hits
+
+winsec_hits = fetch_hits("windows_security", winsec_query)
+nac_hits = fetch_hits("NAC_inventory", nac_query)
+fleet_hits = fetch_hits("fleet_inventory", fleet_query)
+
+# --- Extract and deduplicate names ---
+all_names = set()
+
+# From windows_security
+for hit in winsec_hits:
+    domain = hit['_source'].get('source', {}).get('domain')
+    if domain:
+        all_names.add(domain)
+
+# From NAC_inventory
+for hit in nac_hits:
+    domain = hit['_source'].get('source', {}).get('domain')
+    if domain:
+        all_names.add(domain)
+
+# From fleet_inventory
+for hit in fleet_hits:
+    local_host_name = hit['_source'].get('local_metadata', {}).get('host', {}).get('name')
+    if local_host_name:
+        all_names.add(local_host_name)
+
+# --- Convert to sorted list ---
+unique_names = sorted(all_names)
+
+# --- Print or export results ---
+print(f"Total unique names: {len(unique_names)}")
+print(unique_names)
+
+# --- (Optional) Push to new index ---
+# new_index_data = [{"name": name} for name in unique_names]
+# for doc in new_index_data:
+#     es.index(index="unique_hostnames_index", document=doc)
